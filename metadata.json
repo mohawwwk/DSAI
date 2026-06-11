@@ -1,0 +1,6 @@
+{
+  "name": "Agentic Multimodal Orchestrator",
+  "description": "An agentic multi-tool application supporting simultaneous Text, Image OCR, PDF extraction, Audio speech-to-text, and YouTube transcript fetching with reasoning plan tracing, cost metrics, and intent assessment.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

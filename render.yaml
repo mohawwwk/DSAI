@@ -1,0 +1,16 @@
+# Render manifest for deploying the agentic-multimodal-orchestrator
+services:
+  - type: web
+    name: agentic-multimodal-orchestrator
+    env: docker
+    plan: free
+    dockerfilePath: Dockerfile
+    buildCommand: npm run build
+    startCommand: uvicorn local_backend:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: APP_URL
+        sync: false
