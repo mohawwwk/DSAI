@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import io
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import time
 from typing import Any, Dict, Iterator, List, Optional
 
 import httpx
+import pdfplumber
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, StreamingResponse
@@ -51,6 +53,11 @@ GEMINI_MODELS = [
 
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",
+]
+
+GROQ_VISION_MODELS = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
 ]
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -142,6 +149,54 @@ def should_fallback_to_groq(err: Optional[Exception]) -> bool:
         "401",
         "not authorized",
     ])
+
+
+async def call_groq_vision_completion(mime_type: str, raw_base64: str, text_prompt: str) -> str:
+    """Send an image to Groq's vision model and return extracted text."""
+    api_key = get_groq_api_key()
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY missing.")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    image_url = f"data:{mime_type};base64,{raw_base64}"
+    last_error: Optional[Exception] = None
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for model in GROQ_VISION_MODELS:
+            try:
+                body = {
+                    "model": model,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                            {"type": "text", "text": text_prompt},
+                        ],
+                    }],
+                    "temperature": 0.1,
+                    "max_tokens": 2048,
+                }
+                response = await client.post(GROQ_API_URL, headers=headers, json=body)
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+            except Exception as err:
+                last_error = err
+                print(f"[Groq Vision] Model {model} failed: {err}")
+    raise last_error
+
+
+def extract_pdf_with_pdfplumber(raw_base64: str) -> str:
+    """Extract text from a PDF using pdfplumber (no AI required)."""
+    pdf_bytes = base64.b64decode(raw_base64)
+    text_parts: List[str] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                text_parts.append(f"[Page {i + 1}]\n{page_text.strip()}")
+    return "\n\n".join(text_parts)
 
 
 async def call_groq_completion(contents: Any, require_json: bool = False) -> Any:
@@ -344,7 +399,7 @@ def is_transient_error(err: Exception) -> bool:
     return status in {429, 500, 503}
 
 
-async def call_generate_content(client: genai.Client, contents: Any, config: Optional[Dict[str, Any]] = None) -> Any:
+async def call_generate_content(client: Optional[genai.Client], contents: Any, config: Optional[Dict[str, Any]] = None) -> Any:
     last_error: Optional[Exception] = None
     require_json = isinstance(config, dict) and config.get("response_mime_type") == "application/json"
     has_media = has_inline_content(contents)
@@ -361,32 +416,34 @@ async def call_generate_content(client: genai.Client, contents: Any, config: Opt
     elif groq_key is not None and is_groq_rate_limited():
         print("[Groq] Rate-limited; skipping to Gemini.")
 
-    max_retries = 3
-    for active_model in GEMINI_MODELS:
-        attempts = 0
-        while attempts < max_retries:
-            try:
-                return client.models.generate_content(model=active_model, contents=contents, config=config)
-            except Exception as err:
-                last_error = err
-                if is_transient_error(err):
-                    attempts += 1
-                    if attempts < max_retries:
-                        await asyncio.sleep((2 ** attempts) + random.random() * 0.5)
-                        continue
-                break
+    if client is not None:
+        max_retries = 3
+        for active_model in GEMINI_MODELS:
+            attempts = 0
+            while attempts < max_retries:
+                try:
+                    return client.models.generate_content(model=active_model, contents=contents, config=config)
+                except Exception as err:
+                    last_error = err
+                    if is_transient_error(err):
+                        attempts += 1
+                        if attempts < max_retries:
+                            await asyncio.sleep((2 ** attempts) + random.random() * 0.5)
+                            continue
+                    break
 
-    if groq_key and not has_media and should_fallback_to_groq(last_error):
+    if groq_key and not has_media:
         try:
-            print("[Groq] All Gemini models failed; trying Groq as last resort.")
+            print("[Groq] Gemini unavailable; trying Groq as last resort.")
             return await call_groq_completion(contents, require_json=require_json)
         except Exception as err:
+            last_error = err
             print(f"[Groq] Last-resort Groq call also failed: {err}")
 
-    raise last_error
+    raise last_error or RuntimeError("No AI model available to handle this request.")
 
 
-async def call_generate_content_stream(client: genai.Client, contents: Any, config: Optional[Dict[str, Any]] = None) -> Iterator[Any]:
+async def call_generate_content_stream(client: Optional[genai.Client], contents: Any, config: Optional[Dict[str, Any]] = None) -> Iterator[Any]:
     last_error: Optional[Exception] = None
     require_json = isinstance(config, dict) and config.get("response_mime_type") == "application/json"
     has_media = has_inline_content(contents)
@@ -403,32 +460,34 @@ async def call_generate_content_stream(client: genai.Client, contents: Any, conf
     elif groq_key is not None and is_groq_rate_limited():
         print("[Groq] Rate-limited; skipping to Gemini stream.")
 
-    max_retries = 3
-    for active_model in GEMINI_MODELS:
-        attempts = 0
-        while attempts < max_retries:
-            try:
-                return client.models.generate_content_stream(model=active_model, contents=contents, config=config)
-            except Exception as err:
-                last_error = err
-                if is_transient_error(err):
-                    attempts += 1
-                    if attempts < max_retries:
-                        await asyncio.sleep((2 ** attempts) + random.random() * 0.5)
+    if client is not None:
+        max_retries = 3
+        for active_model in GEMINI_MODELS:
+            attempts = 0
+            while attempts < max_retries:
+                try:
+                    return client.models.generate_content_stream(model=active_model, contents=contents, config=config)
+                except Exception as err:
+                    last_error = err
+                    if is_transient_error(err):
+                        attempts += 1
+                        if attempts < max_retries:
+                            await asyncio.sleep((2 ** attempts) + random.random() * 0.5)
                         continue
-                break
+                    break
 
-    if groq_key and not has_media and should_fallback_to_groq(last_error):
+    if groq_key and not has_media:
         try:
-            print("[Groq] All Gemini models failed; trying Groq stream as last resort.")
+            print("[Groq] Gemini unavailable; trying Groq stream as last resort.")
             return await call_groq_completion_stream(contents, require_json=require_json)
         except Exception as err:
+            last_error = err
             print(f"[Groq] Last-resort Groq stream also failed: {err}")
 
-    raise last_error
+    raise last_error or RuntimeError("No AI model available to handle this request.")
 
 
-async def call_intent_assessor(client: genai.Client, unified_context: str) -> Dict[str, Any]:
+async def call_intent_assessor(client: Optional[genai.Client], unified_context: str) -> Dict[str, Any]:
     prompt_text = (
         "You are an agentic task classifier. Analyze the unified context below and classify the user's intent.\n\n"
         "TASK DETECTION RULES — apply in this order:\n"
@@ -498,13 +557,17 @@ async def run_agent_pipeline(body: RunRequest) -> Iterator[str]:
         plan_trace.append(step)
         return format_event("step", {"step": step})
 
+    gemini_client: Optional[genai.Client] = None
     try:
-        client = get_gemini_client()
+        gemini_client = get_gemini_client()
     except Exception as err:
-        yield format_event("error", {"message": str(err)})
+        print(f"[Startup] Gemini client unavailable: {err}. Running in Groq-only mode.")
+
+    if gemini_client is None and get_groq_api_key() is None:
+        yield format_event("error", {"message": "No AI models available. Please configure GEMINI_API_KEY or GROQ_API_KEY in Secrets."})
         return
 
-    yield emit_step("Initialize Request", "success", "Received request, validated prompt inputs.")
+    yield emit_step("Initialize Request", "success", f"Received request. {'Gemini + Groq' if gemini_client else 'Groq-only'} mode active.")
 
     if body.files:
         yield emit_step("Multimodal Extractors", "running", f"Processing {len(body.files)} uploads concurrently...")
@@ -517,71 +580,118 @@ async def run_agent_pipeline(body: RunRequest) -> Iterator[str]:
             estimated_input_tokens += len(raw_base64) // 4
             try:
                 if mime_type.startswith("image/"):
-                    response = await call_generate_content(
-                        client,
-                        contents=[
-                            {"inline_data": {"mime_type": mime_type, "data": raw_base64}},
-                            "Perform optical character recognition (OCR) and extract all readable text or code from this image. Output a JSON object with this precise scheme: { \"text\": \"extracted text/code here\", \"confidence\": 95 } where confidence is an integer from 0 to 100 indicating extraction quality.",
-                        ],
-                        config={
-                            "response_mime_type": "application/json",
-                            "response_schema": {
-                                "type": "object",
-                                "properties": {
-                                    "text": {"type": "string"},
-                                    "confidence": {"type": "integer"},
+                    gemini_ok = False
+                    if gemini_client is not None:
+                        try:
+                            response = await call_generate_content(
+                                gemini_client,
+                                contents=[
+                                    {"inline_data": {"mime_type": mime_type, "data": raw_base64}},
+                                    "Perform optical character recognition (OCR) and extract all readable text or code from this image. Output a JSON object with this precise scheme: { \"text\": \"extracted text/code here\", \"confidence\": 95 } where confidence is an integer from 0 to 100 indicating extraction quality.",
+                                ],
+                                config={
+                                    "response_mime_type": "application/json",
+                                    "response_schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "text": {"type": "string"},
+                                            "confidence": {"type": "integer"},
+                                        },
+                                        "required": ["text", "confidence"],
+                                    },
                                 },
-                                "required": ["text", "confidence"],
-                            },
-                        },
-                    )
-                    parsed = json.loads(flatten_response_text(response) or "{}")
-                    file_text = parsed.get("text", "")
-                    ocr_confidence = parsed.get("confidence", 90)
+                            )
+                            parsed = json.loads(flatten_response_text(response) or "{}")
+                            file_text = parsed.get("text", "")
+                            ocr_confidence = parsed.get("confidence", 90)
+                            gemini_ok = True
+                        except Exception as gemini_err:
+                            print(f"[Gemini] Image OCR failed: {gemini_err}. Trying Groq Vision...")
+
+                    if not gemini_ok:
+                        try:
+                            file_text = await call_groq_vision_completion(
+                                mime_type, raw_base64,
+                                "Perform OCR on this image. Extract ALL readable text and code verbatim. Return only the extracted text with no extra commentary."
+                            )
+                            ocr_confidence = 80
+                            yield emit_step("Groq Vision Fallback", "success", f"Image OCR completed via Groq Vision for {file.name}.")
+                        except Exception as groq_err:
+                            file_text = f"[Image OCR unavailable: both Gemini and Groq Vision failed — {groq_err}]"
+                            ocr_confidence = 0
+                            yield emit_step("Image OCR", "error", f"All OCR models failed for {file.name}.")
+
                 elif mime_type == "application/pdf":
-                    response = await call_generate_content(
-                        client,
-                        contents=[
-                            {"inline_data": {"mime_type": mime_type, "data": raw_base64}},
-                            "Analyze this PDF document. Extract all readable text, tables, headers, and code snippets. Output a JSON object with this precise scheme: { \"text\": \"extracted text and layout details here\", \"confidence\": 95 } where confidence is an integer indicating your parsing assessment.",
-                        ],
-                        config={
-                            "response_mime_type": "application/json",
-                            "response_schema": {
-                                "type": "object",
-                                "properties": {
-                                    "text": {"type": "string"},
-                                    "confidence": {"type": "integer"},
+                    gemini_ok = False
+                    if gemini_client is not None:
+                        try:
+                            response = await call_generate_content(
+                                gemini_client,
+                                contents=[
+                                    {"inline_data": {"mime_type": mime_type, "data": raw_base64}},
+                                    "Analyze this PDF document. Extract all readable text, tables, headers, and code snippets. Output a JSON object with this precise scheme: { \"text\": \"extracted text and layout details here\", \"confidence\": 95 } where confidence is an integer indicating your parsing assessment.",
+                                ],
+                                config={
+                                    "response_mime_type": "application/json",
+                                    "response_schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "text": {"type": "string"},
+                                            "confidence": {"type": "integer"},
+                                        },
+                                        "required": ["text", "confidence"],
+                                    },
                                 },
-                                "required": ["text", "confidence"],
-                            },
-                        },
-                    )
-                    parsed = json.loads(flatten_response_text(response) or "{}")
-                    file_text = parsed.get("text", "")
-                    ocr_confidence = parsed.get("confidence", 90)
+                            )
+                            parsed = json.loads(flatten_response_text(response) or "{}")
+                            file_text = parsed.get("text", "")
+                            ocr_confidence = parsed.get("confidence", 90)
+                            gemini_ok = True
+                        except Exception as gemini_err:
+                            print(f"[Gemini] PDF extraction failed: {gemini_err}. Falling back to pdfplumber...")
+
+                    if not gemini_ok:
+                        try:
+                            file_text = extract_pdf_with_pdfplumber(raw_base64)
+                            ocr_confidence = 85
+                            yield emit_step("PDF Fallback", "success", f"PDF parsed via pdfplumber (no AI) for {file.name}.")
+                        except Exception as pdf_err:
+                            file_text = f"[PDF extraction unavailable: {pdf_err}]"
+                            ocr_confidence = 0
+                            yield emit_step("PDF Extraction", "error", f"All PDF extraction methods failed for {file.name}.")
+
                 elif mime_type.startswith("audio/"):
-                    response = await call_generate_content(
-                        client,
-                        contents=[
-                            {"inline_data": {"mime_type": mime_type, "data": raw_base64}},
-                            "Listen to this audio file and transcribe all spoken dialogue clearly. Extract or estimate the total audio duration in minutes and seconds (e.g. '04:15'). Output a JSON object with this precise scheme: { \"text\": \"clean transcription here\", \"duration\": \"04:15\" }.",
-                        ],
-                        config={
-                            "response_mime_type": "application/json",
-                            "response_schema": {
-                                "type": "object",
-                                "properties": {
-                                    "text": {"type": "string"},
-                                    "duration": {"type": "string"},
+                    if gemini_client is not None:
+                        try:
+                            response = await call_generate_content(
+                                gemini_client,
+                                contents=[
+                                    {"inline_data": {"mime_type": mime_type, "data": raw_base64}},
+                                    "Listen to this audio file and transcribe all spoken dialogue clearly. Extract or estimate the total audio duration in minutes and seconds (e.g. '04:15'). Output a JSON object with this precise scheme: { \"text\": \"clean transcription here\", \"duration\": \"04:15\" }.",
+                                ],
+                                config={
+                                    "response_mime_type": "application/json",
+                                    "response_schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "text": {"type": "string"},
+                                            "duration": {"type": "string"},
+                                        },
+                                        "required": ["text", "duration"],
+                                    },
                                 },
-                                "required": ["text", "duration"],
-                            },
-                        },
-                    )
-                    parsed = json.loads(flatten_response_text(response) or "{}")
-                    file_text = parsed.get("text", "")
-                    duration = parsed.get("duration", "0:00")
+                            )
+                            parsed = json.loads(flatten_response_text(response) or "{}")
+                            file_text = parsed.get("text", "")
+                            duration = parsed.get("duration", "0:00")
+                        except Exception as gemini_err:
+                            file_text = f"[Audio transcription unavailable: Gemini failed ({gemini_err}). Audio processing requires Gemini — please check your GEMINI_API_KEY.]"
+                            duration = "unknown"
+                            yield emit_step("Audio Transcription", "error", f"Gemini required for audio — transcription skipped for {file.name}.")
+                    else:
+                        file_text = "[Audio transcription unavailable: Gemini API key not configured. Audio processing requires Gemini.]"
+                        duration = "unknown"
+                        yield emit_step("Audio Transcription", "error", "Gemini API key required for audio transcription.")
                 else:
                     file_text = str(base64.b64decode(raw_base64), "utf-8", errors="replace")
                     ocr_confidence = 100
@@ -647,7 +757,7 @@ async def run_agent_pipeline(body: RunRequest) -> Iterator[str]:
     yield emit_step("Intent Assessor", "running", "Analyzing completeness and task suitability...")
 
     try:
-        assessment = await call_intent_assessor(client, unified_context)
+        assessment = await call_intent_assessor(gemini_client, unified_context)
     except Exception as err:
         assessment = {
             "isFollowUpRequired": False,
@@ -738,7 +848,7 @@ Respond in clean Markdown. Be direct and precise. Do not add metadata headers or
 
     full_final_result_text = ""
     response_stream = await call_generate_content_stream(
-        client,
+        gemini_client,
         contents=final_query_prompt,
     )
 
