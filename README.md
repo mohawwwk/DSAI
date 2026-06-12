@@ -1,8 +1,3 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
-
-This repository contains an agentic multimodal orchestrator (FastAPI backend + Vite React frontend).
 
 Features
 - Accepts text, images (OCR), PDFs (text + OCR fallback), and audio (speech-to-text).
