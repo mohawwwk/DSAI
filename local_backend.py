@@ -21,10 +21,17 @@ load_dotenv()
 
 app = FastAPI()
 
+@app.on_event("startup")
+async def verify_api_keys():
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    groq_key = os.getenv("GROQ_API_KEY")
+    print(f"[Startup] GEMINI_API_KEY: {'✓ loaded' if gemini_key else '✗ MISSING'}")
+    print(f"[Startup] GROQ_API_KEY:   {'✓ loaded' if groq_key else '✗ MISSING'}")
+
 # Enable CORS for frontend on port 5173
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173", "http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -85,6 +92,8 @@ def get_gemini_client() -> genai.Client:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY environment variable is missing. Please configure it in your Secrets.")
+    # Remove GOOGLE_API_KEY from process env so the SDK uses our explicit api_key instead
+    os.environ.pop("GOOGLE_API_KEY", None)
     return genai.Client(api_key=api_key)
 
 
@@ -135,7 +144,7 @@ def should_fallback_to_groq(err: Optional[Exception]) -> bool:
     ])
 
 
-async def call_groq_completion(contents: Any) -> Any:
+async def call_groq_completion(contents: Any, require_json: bool = False) -> Any:
     api_key = get_groq_api_key()
     if not api_key:
         raise RuntimeError("GROQ_API_KEY environment variable is missing.")
@@ -151,16 +160,15 @@ async def call_groq_completion(contents: Any) -> Any:
         for model in GROQ_MODELS:
             for attempt in range(2):
                 try:
-                    response = await client.post(
-                        GROQ_API_URL,
-                        headers=headers,
-                        json={
-                            "model": model,
-                            "messages": [{"role": "user", "content": prompt_text}],
-                            "temperature": 0.2,
-                            "max_tokens": 2048,
-                        },
-                    )
+                    body: Dict[str, Any] = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt_text}],
+                        "temperature": 0.2,
+                        "max_tokens": 2048,
+                    }
+                    if require_json:
+                        body["response_format"] = {"type": "json_object"}
+                    response = await client.post(GROQ_API_URL, headers=headers, json=body)
                     response.raise_for_status()
                     return normalize_model_response(response.json())
                 except Exception as err:
@@ -175,7 +183,7 @@ async def call_groq_completion(contents: Any) -> Any:
     raise last_error
 
 
-async def call_groq_completion_stream(contents: Any) -> Iterator[Any]:
+async def call_groq_completion_stream(contents: Any, require_json: bool = False) -> Iterator[Any]:
     api_key = get_groq_api_key()
     if not api_key:
         raise RuntimeError("GROQ_API_KEY environment variable is missing.")
@@ -191,17 +199,16 @@ async def call_groq_completion_stream(contents: Any) -> Iterator[Any]:
         for model in GROQ_MODELS:
             for attempt in range(2):
                 try:
-                    response = await client.post(
-                        GROQ_API_URL,
-                        headers=headers,
-                        json={
-                            "model": model,
-                            "messages": [{"role": "user", "content": prompt_text}],
-                            "temperature": 0.2,
-                            "max_tokens": 2048,
-                            "stream": False,
-                        },
-                    )
+                    body: Dict[str, Any] = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt_text}],
+                        "temperature": 0.2,
+                        "max_tokens": 2048,
+                        "stream": False,
+                    }
+                    if require_json:
+                        body["response_format"] = {"type": "json_object"}
+                    response = await client.post(GROQ_API_URL, headers=headers, json=body)
                     response.raise_for_status()
                     return iter([normalize_model_response(response.json())])
                 except Exception as err:
@@ -339,17 +346,20 @@ def is_transient_error(err: Exception) -> bool:
 
 async def call_generate_content(client: genai.Client, contents: Any, config: Optional[Dict[str, Any]] = None) -> Any:
     last_error: Optional[Exception] = None
-    use_groq_first = get_groq_api_key() is not None and not has_inline_content(contents) and not is_groq_rate_limited()
+    require_json = isinstance(config, dict) and config.get("response_mime_type") == "application/json"
+    has_media = has_inline_content(contents)
+    groq_key = get_groq_api_key()
+    use_groq_first = groq_key is not None and not has_media and not is_groq_rate_limited()
 
     if use_groq_first:
         try:
-            print("[Groq Fallback] Using Groq first for text generation.")
-            return await call_groq_completion(contents)
+            print(f"[Groq] Using Groq first (require_json={require_json}).")
+            return await call_groq_completion(contents, require_json=require_json)
         except Exception as err:
             last_error = err
-            print(f"[Groq Fallback] Initial Groq generate_content attempt failed: {err}")
-    elif get_groq_api_key() is not None and is_groq_rate_limited():
-        print("[Groq Fallback] Groq currently rate-limited; skipping to Gemini.")
+            print(f"[Groq] Primary call failed, falling back to Gemini: {err}")
+    elif groq_key is not None and is_groq_rate_limited():
+        print("[Groq] Rate-limited; skipping to Gemini.")
 
     max_retries = 3
     for active_model in GEMINI_MODELS:
@@ -366,29 +376,32 @@ async def call_generate_content(client: genai.Client, contents: Any, config: Opt
                         continue
                 break
 
-    if get_groq_api_key() and not has_inline_content(contents) and should_fallback_to_groq(last_error):
+    if groq_key and not has_media and should_fallback_to_groq(last_error):
         try:
-            return await call_groq_completion(contents)
+            print("[Groq] All Gemini models failed; trying Groq as last resort.")
+            return await call_groq_completion(contents, require_json=require_json)
         except Exception as err:
-            print(f"[Groq Fallback] Secondary Groq generate_content attempt failed: {err}")
-            pass
+            print(f"[Groq] Last-resort Groq call also failed: {err}")
 
     raise last_error
 
 
 async def call_generate_content_stream(client: genai.Client, contents: Any, config: Optional[Dict[str, Any]] = None) -> Iterator[Any]:
     last_error: Optional[Exception] = None
-    use_groq_first = get_groq_api_key() is not None and not has_inline_content(contents) and not is_groq_rate_limited()
+    require_json = isinstance(config, dict) and config.get("response_mime_type") == "application/json"
+    has_media = has_inline_content(contents)
+    groq_key = get_groq_api_key()
+    use_groq_first = groq_key is not None and not has_media and not is_groq_rate_limited()
 
     if use_groq_first:
         try:
-            print("[Groq Fallback] Using Groq first for streaming generation.")
-            return await call_groq_completion_stream(contents)
+            print(f"[Groq] Using Groq first for streaming (require_json={require_json}).")
+            return await call_groq_completion_stream(contents, require_json=require_json)
         except Exception as err:
             last_error = err
-            print(f"[Groq Fallback] Initial Groq generate_content_stream attempt failed: {err}")
-    elif get_groq_api_key() is not None and is_groq_rate_limited():
-        print("[Groq Fallback] Groq currently rate-limited; skipping to Gemini stream.")
+            print(f"[Groq] Primary stream call failed, falling back to Gemini: {err}")
+    elif groq_key is not None and is_groq_rate_limited():
+        print("[Groq] Rate-limited; skipping to Gemini stream.")
 
     max_retries = 3
     for active_model in GEMINI_MODELS:
@@ -405,24 +418,34 @@ async def call_generate_content_stream(client: genai.Client, contents: Any, conf
                         continue
                 break
 
-    if get_groq_api_key() and not has_inline_content(contents) and should_fallback_to_groq(last_error):
+    if groq_key and not has_media and should_fallback_to_groq(last_error):
         try:
-            return await call_groq_completion_stream(contents)
+            print("[Groq] All Gemini models failed; trying Groq stream as last resort.")
+            return await call_groq_completion_stream(contents, require_json=require_json)
         except Exception as err:
-            print(f"[Groq Fallback] Secondary Groq generate_content_stream attempt failed: {err}")
-            pass
+            print(f"[Groq] Last-resort Groq stream also failed: {err}")
 
     raise last_error
 
 
 async def call_intent_assessor(client: genai.Client, unified_context: str) -> Dict[str, Any]:
     prompt_text = (
-        "Verify the task and completeness of the context.\n"
-        "You must analyze if clarification is needed prior to executing the user query.\n"
+        "You are an agentic task classifier. Analyze the unified context below and classify the user's intent.\n\n"
+        "TASK DETECTION RULES — apply in this order:\n"
+        "1. If the context contains a '=== YOUTUBE VIDEO TRANSCRIPT ===' section → detectedTask = 'transcript_summary'\n"
+        "2. If an audio file (audio/ MIME) is present AND the user wants a summary, transcription, or description → detectedTask = 'transcript_summary'\n"
+        "3. If multiple different file types are present (e.g. audio + PDF, image + PDF) AND the query compares, contrasts, or combines them → detectedTask = 'cross_input_reasoning'\n"
+        "4. If extracted content contains code (functions, classes, syntax) AND the user wants explanation, bug detection, or complexity → detectedTask = 'code_explanation'\n"
+        "5. If the user wants a structured summary with bullets or multi-format output of text/PDF → detectedTask = 'summarization'\n"
+        "6. If the user wants sentiment, tone, or emotion analysis → detectedTask = 'sentiment'\n"
+        "7. For all other questions, direct queries, or information retrieval from a document → detectedTask = 'general_qa'\n\n"
+        "FOLLOW-UP RULE — set isFollowUpRequired = true ONLY if:\n"
+        "- The task is genuinely ambiguous with no clear goal (e.g. 'do something with this')\n"
+        "- Do NOT ask follow-up if intent is clear (e.g. 'explain', 'summarize', 'what are the action items?')\n\n"
         "Output a JSON object conforming exactly to this schema:\n"
         "{\n"
         "  \"isFollowUpRequired\": true or false,\n"
-        "  \"followUpQuestion\": \"A short descriptive follow-up question here if isFollowUpRequired is true, else null\",\n"
+        "  \"followUpQuestion\": \"A short clarifying question if isFollowUpRequired is true, else null\",\n"
         "  \"detectedTask\": \"summarization\" or \"sentiment\" or \"code_explanation\" or \"transcript_summary\" or \"cross_input_reasoning\" or \"general_qa\",\n"
         "  \"reasoningPlan\": [\"Step 1 description\", \"Step 2 description\"]\n"
         "}\n\n"
@@ -655,33 +678,63 @@ async def run_agent_pipeline(body: RunRequest) -> Iterator[str]:
     yield emit_step("Intent Assessor", "success", f"Identified task context: [{assessment.get('detectedTask', 'general_qa').upper()}]. Proceeding to build result.")
     yield emit_step("Generator Pipeline", "running", "Synthesizing streamed analysis response...")
 
-    final_query_prompt = f"""Ensure you strictly satisfy the requirements for this specific task:
-- Detected Task: \"{assessment.get('detectedTask')}\"
-- Specific Rules for Tasks:
-  - If \"summarization\": You MUST format and return exactly three components explicitly:
-    1. A \"1-Line Summary\" (labeled clearly)
-    2. \"3 Key Bullet Points\" (labeled clearly)
-    3. A \"5-Sentence Summary\" (labeled clearly)
-  - If \"sentiment\": You MUST output:
-    1. A Sentiment Label (Positive / Negative / Neutral)
-    2. A Confidence Percentage (e.g. 95%)
-    3. A direct \"1-Line Justification\"
-  - If \"code_explanation\": You MUST output:
-    1. An elegant explanation of what the code does
-    2. Bug detection / warning about any bugs found
-    3. Strict \"Time and Space Complexity Analysis\"
-  - If \"transcript_summary\" or \"audio transcription + summary\": You MUST output:
-    1. Fully cleaned audio transcription text
-    2. A \"1-Line Summary\"
-    3. \"3 Bullet Points\"
-    4. A \"5-Sentence Summary\"
-    5. Mention any duration or files referenced.
-  - If \"cross_input_reasoning\": Combine, contrast, and reference multiple inputs gracefully (such as files, transcription logs, or queries) in a unified, professional comparative breakdown.
+    final_query_prompt = f"""You are an expert AI assistant. Strictly satisfy the output requirements for the detected task below.
+
+Detected Task: \"{assessment.get('detectedTask')}\"
+
+OUTPUT FORMAT RULES (follow exactly for the detected task):
+
+- \"summarization\":
+  Return exactly three labeled sections:
+  ## 1-Line Summary
+  (one sentence)
+  ## 3 Key Bullet Points
+  - bullet 1
+  - bullet 2
+  - bullet 3
+  ## 5-Sentence Summary
+  (five sentences)
+
+- \"sentiment\":
+  Return exactly:
+  **Sentiment Label:** Positive / Negative / Neutral
+  **Confidence:** XX%
+  **Justification:** (one sentence explaining why)
+
+- \"code_explanation\":
+  Return exactly three labeled sections:
+  ## Code Explanation
+  (what the code does, language detected)
+  ## Bug Detection
+  (list any bugs or issues found, or \"No bugs detected\")
+  ## Time & Space Complexity
+  (Big-O analysis)
+
+- \"transcript_summary\":
+  Return exactly:
+  ## Transcription
+  (full cleaned transcript text)
+  ## 1-Line Summary
+  (one sentence)
+  ## 3 Bullet Points
+  - bullet 1
+  - bullet 2
+  - bullet 3
+  ## 5-Sentence Summary
+  (five sentences)
+  ## Duration / Source
+  (mention audio duration or YouTube video if referenced)
+
+- \"cross_input_reasoning\":
+  Combine and contrast all provided inputs (audio transcriptions, PDF text, images, YouTube transcripts) into a unified comparative analysis. Reference each source explicitly. Answer the user's query directly.
+
+- \"general_qa\":
+  Answer the user's question directly and comprehensively using only the information in the provided context. If the user asks for action items, tasks, or a specific list — return them as a clean numbered or bulleted list. Do not pad the answer with unnecessary context.
 
 Unified context:
 {unified_context}
 
-Generate your response in pristine Markdown format. Make it direct, clean, without tech-larping or metadata banners. Ensure it satisfies all the strict conditions above."""
+Respond in clean Markdown. Be direct and precise. Do not add metadata headers or commentary outside the required format."""
 
     full_final_result_text = ""
     response_stream = await call_generate_content_stream(
