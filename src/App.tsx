@@ -6,16 +6,11 @@
 import React, { useState, useRef, useEffect } from "react";
 import {
   Send,
-  Sparkles,
-  RefreshCw,
   FileText,
   Route,
   Loader2,
   Trash2,
-  Cpu,
   Layers,
-  CheckCircle,
-  Clock,
   HelpCircle
 } from "lucide-react";
 import { UploadedFile, Message, AgentResponse, ExtractedContent, ToolStep } from "./types";
@@ -44,25 +39,27 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (messages.length > 0 || currentStreamedText) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [messages, currentStreamedText]);
 
   // Quick preset loader helper
   const handleLoadTestCase = (id: number) => {
     if (id === 1) {
-      setPrompt("Summarize this audio file. Give me a 1-line summary, 3 bullets, and a 5-sentence summary.");
+      setPrompt("Transcribe this audio file and produce: a 1-line summary, 3 bullet points, and a 5-sentence summary. Also mention the duration.");
       setFiles([]);
     } else if (id === 2) {
       setPrompt("What are the action items in this meeting notes PDF?");
       setFiles([]);
     } else if (id === 3) {
-      setPrompt("Explain this code. Detect any bugs and warn me about complexity.");
+      setPrompt("Explain this code snippet. Detect any bugs and warn me about time and space complexity.");
       setFiles([]);
     } else if (id === 4) {
-      setPrompt("Hit the YT URL in this text and give me a summary of it: https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+      setPrompt("Hit the YouTube URL in this PDF and give me a full summary of it: 1-line summary, 3 bullet points, and a 5-sentence summary.");
       setFiles([]);
     } else if (id === 5) {
-      setPrompt("Do the audio file and the PDF document discuss the same topic or match in action metrics?");
+      setPrompt("Do the audio file and the PDF document discuss the same topic? Compare their content and give a detailed comparative analysis.");
       setFiles([]);
     }
   };
@@ -116,7 +113,7 @@ export default function App() {
     }));
 
     try {
-      const response = await fetch("http://localhost:8001/api/agent/run", {
+      const response = await fetch("/api/agent/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -218,9 +215,6 @@ export default function App() {
       {/* Header */}
       <header id="app-header" className="sticky top-0 z-40 bg-white border-b border-gray-100 px-6 py-4 flex items-center justify-between shadow-sm">
         <div className="flex items-center gap-3">
-          <div className="p-2 bg-indigo-600 text-white rounded-xl shadow-md shadow-indigo-100 flex items-center justify-center">
-            <Sparkles className="h-5 w-5 animate-pulse" />
-          </div>
           <div>
             <h1 className="text-base font-bold text-gray-900 tracking-tight">Agentic Multimodal Orchestrator</h1>
             <p className="text-xs text-gray-400">Simultaneous Voice, Documents, Code OCR, and YouTube Transcribing Workspace</p>
@@ -240,20 +234,17 @@ export default function App() {
       </header>
 
       {/* Main Split Panel Workspace */}
-      <div className="flex-1 max-w-[1700px] w-full mx-auto p-4 md:p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 overflow-hidden">
+      <div className="flex-1 max-w-[1700px] w-full mx-auto p-4 md:p-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
         
         {/* Left Side: Client Console & Chat Flow (Col Span 7) */}
-        <section id="chat-section" className="lg:col-span-7 flex flex-col bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden min-h-[600px] h-[calc(100vh-140px)]">
+        <section id="chat-section" className="lg:col-span-7 flex flex-col bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden h-[calc(100vh-120px)]">
           
           {/* Scrollable Messages Panel */}
-          <div className="flex-1 overflow-y-auto p-5 space-y-6">
+          <div className="flex-1 overflow-y-auto p-5 space-y-6 min-h-0">
             {messages.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto space-y-6">
-                <div className="p-4 bg-indigo-50/50 rounded-full border border-indigo-100 animate-bounce">
-                  <Sparkles className="h-10 w-10 text-indigo-500" />
-                </div>
+              <div className="flex flex-col items-center text-center max-w-md mx-auto space-y-5 py-6">
                 <div>
-                  <h3 className="text-base font-bold text-gray-800">Welcome to the Multi-Tool Agent</h3>
+                  <h3 className="text-base font-bold text-gray-800">Multimodal Orchestrator</h3>
                   <p className="text-xs text-slate-400 mt-1 leading-relaxed">
                     Upload multiple files simultaneously (Images for OCR, searchable or scanned PDFs, Audio file transcriptions) and input text. The agent autonomously plans reasoning routes and fetches YouTube transcriptions dynamically.
                   </p>
@@ -265,49 +256,25 @@ export default function App() {
                     Try Guided Pipeline Queries
                   </h4>
                   <div className="grid grid-cols-1 gap-2">
-                    <button
-                      onClick={() => handleLoadTestCase(1)}
-                      className="w-full text-left p-3 border border-gray-200 hover:border-indigo-400 hover:bg-slate-50 rounded-xl transition duration-150 flex items-start gap-2 text-xs"
-                    >
-                      <span className="p-1 bg-indigo-50 text-indigo-600 rounded-md font-mono mt-0.5">Preset 1</span>
-                      <div>
-                        <p className="font-semibold text-gray-700">Audio Transcription + Summary</p>
-                        <p className="text-[10px] text-gray-400">Submit audio file outputting 1-line + bullets + 5-sentence</p>
-                      </div>
-                    </button>
-
-                    <button
-                      onClick={() => handleLoadTestCase(2)}
-                      className="w-full text-left p-3 border border-gray-200 hover:border-indigo-400 hover:bg-slate-50 rounded-xl transition duration-150 flex items-start gap-2 text-xs"
-                    >
-                      <span className="p-1 bg-indigo-50 text-indigo-600 rounded-md font-mono mt-0.5">Preset 2</span>
-                      <div>
-                        <p className="font-semibold text-gray-700">PDF Document + Layout extract</p>
-                        <p className="text-[10px] text-gray-400">Submit a meeting notes PDF querying Action items only</p>
-                      </div>
-                    </button>
-
-                    <button
-                      onClick={() => handleLoadTestCase(3)}
-                      className="w-full text-left p-3 border border-gray-200 hover:border-indigo-400 hover:bg-slate-50 rounded-xl transition duration-150 flex items-start gap-2 text-xs"
-                    >
-                      <span className="p-1 bg-indigo-50 text-indigo-600 rounded-md font-mono mt-0.5">Preset 3</span>
-                      <div>
-                        <p className="font-semibold text-gray-700">Image Screenshot with Code</p>
-                        <p className="text-[10px] text-gray-400">Perform visual OCR detecting bugs and space constraints</p>
-                      </div>
-                    </button>
-
-                    <button
-                      onClick={() => handleLoadTestCase(4)}
-                      className="w-full text-left p-3 border border-gray-200 hover:border-indigo-400 hover:bg-slate-50 rounded-xl transition duration-150 flex items-start gap-2 text-xs"
-                    >
-                      <span className="p-1 bg-indigo-50 text-indigo-600 rounded-md font-mono mt-0.5">Preset 4</span>
-                      <div>
-                        <p className="font-semibold text-gray-700">Cross-Input YouTube Transcribing</p>
-                        <p className="text-[10px] text-gray-400">Auto-scrapes YouTube transcript URLs embedded anywhere</p>
-                      </div>
-                    </button>
+                    {[
+                      { id: 1, title: "Audio Transcription + Summary", sub: "Submit audio file → 1-line + 3 bullets + 5-sentence summary" },
+                      { id: 2, title: "PDF + Natural Language Query", sub: 'Upload meeting notes PDF → ask "What are the action items?"' },
+                      { id: 3, title: "Image with Code", sub: "Upload code screenshot → OCR + explain + bug detection" },
+                      { id: 4, title: "Cross-Input YouTube Chain", sub: "PDF with YouTube URL → fetch transcript → full summary" },
+                      { id: 5, title: "Multi-File Unified Query", sub: "Audio + PDF → compare topics across both files" },
+                    ].map(({ id, title, sub }) => (
+                      <button
+                        key={id}
+                        onClick={() => handleLoadTestCase(id)}
+                        className="w-full text-left p-3 border border-gray-200 hover:border-indigo-400 hover:bg-slate-50 rounded-xl transition duration-150 flex items-start gap-2 text-xs"
+                      >
+                        <span className="p-1 bg-indigo-50 text-indigo-600 rounded-md font-mono mt-0.5 shrink-0">Preset {id}</span>
+                        <div>
+                          <p className="font-semibold text-gray-700">{title}</p>
+                          <p className="text-[10px] text-gray-400">{sub}</p>
+                        </div>
+                      </button>
+                    ))}
                   </div>
                 </div>
               </div>
@@ -432,7 +399,7 @@ export default function App() {
         </section>
 
         {/* Right Side: Execution Dashboard & Plan Trace (Col Span 5) */}
-        <aside id="execution-aside" className="lg:col-span-5 flex flex-col gap-5 h-[calc(100vh-140px)] overflow-hidden">
+        <aside id="execution-aside" className="lg:col-span-5 flex flex-col gap-5 h-[calc(100vh-120px)] overflow-hidden">
           
           {/* Navigation Tab Panel */}
           <div className="bg-white border border-gray-200 p-1.5 rounded-xl flex shadow-xs gap-1">
